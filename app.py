@@ -11,15 +11,25 @@ Run with:
 import io
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import IsolationForest, RandomForestRegressor
-from sklearn.neighbors import LocalOutlierFactor
+from sklearn.ensemble import (
+    IsolationForest,
+    RandomForestRegressor,
+    GradientBoostingRegressor,
+    ExtraTreesRegressor,
+)
+from sklearn.neighbors import LocalOutlierFactor, KNeighborsRegressor
 from sklearn.svm import OneClassSVM, SVR
+from sklearn.covariance import EllipticEnvelope
+from sklearn.mixture import GaussianMixture
+from sklearn.decomposition import PCA
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 try:
@@ -27,6 +37,26 @@ try:
     XGB_AVAILABLE = True
 except ImportError:
     XGB_AVAILABLE = False
+
+ANOMALY_MODELS = [
+    "Isolation Forest",
+    "Local Outlier Factor",
+    "One-Class SVM",
+    "Elliptic Envelope (Robust Covariance)",
+    "Gaussian Mixture Model",
+    "PCA Reconstruction Error",
+]
+
+REGRESSION_MODELS = [
+    "Random Forest",
+    "Extra Trees",
+    "Gradient Boosting",
+    "Support Vector Regression",
+    "Ridge Regression",
+    "K-Nearest Neighbors",
+]
+if XGB_AVAILABLE:
+    REGRESSION_MODELS.insert(2, "XGBoost")
 
 st.set_page_config(
     page_title="Railway Anomaly Detection & Failure Prediction",
@@ -117,6 +147,43 @@ def get_anomaly_scores(model_name, X_train, X_test, params):
         test_scores = model.decision_function(X_test)
         native_threshold = 0.0
 
+    elif model_name == "Elliptic Envelope (Robust Covariance)":
+        model = EllipticEnvelope(
+            contamination=params["contamination"],
+            support_fraction=params["support_fraction"],
+            random_state=42,
+        )
+        model.fit(X_train)
+        train_scores = model.decision_function(X_train)
+        test_scores = model.decision_function(X_test)
+        native_threshold = 0.0
+
+    elif model_name == "Gaussian Mixture Model":
+        model = GaussianMixture(
+            n_components=params["n_components"],
+            covariance_type="full",
+            random_state=42,
+        )
+        model.fit(X_train)
+        train_scores = model.score_samples(X_train)  # log-likelihood, higher = normal
+        test_scores = model.score_samples(X_test)
+        native_threshold = np.percentile(train_scores, params["contamination"] * 100)
+
+    elif model_name == "PCA Reconstruction Error":
+        n_comp = min(params["n_components"], X_train.shape[1])
+        model = PCA(n_components=n_comp, random_state=42)
+        model.fit(X_train)
+
+        def _neg_recon_error(X):
+            X_proj = model.transform(X)
+            X_recon = model.inverse_transform(X_proj)
+            err = np.mean((np.asarray(X) - X_recon) ** 2, axis=1)
+            return -err  # higher = normal (lower reconstruction error)
+
+        train_scores = _neg_recon_error(X_train)
+        test_scores = _neg_recon_error(X_test)
+        native_threshold = np.percentile(train_scores, params["contamination"] * 100)
+
     else:
         raise ValueError("Unknown model")
 
@@ -141,7 +208,109 @@ def get_regressor(model_name, params):
         )
     if model_name == "Support Vector Regression":
         return SVR(kernel="rbf", C=params["C"], epsilon=params["epsilon"], gamma="scale")
+    if model_name == "Extra Trees":
+        return ExtraTreesRegressor(
+            n_estimators=params["n_estimators"],
+            max_depth=params["max_depth"],
+            random_state=42,
+            n_jobs=-1,
+        )
+    if model_name == "Gradient Boosting":
+        return GradientBoostingRegressor(
+            n_estimators=params["n_estimators"],
+            max_depth=params["max_depth"],
+            learning_rate=params["learning_rate"],
+            random_state=42,
+        )
+    if model_name == "Ridge Regression":
+        return Ridge(alpha=params["alpha"], random_state=42)
+    if model_name == "K-Nearest Neighbors":
+        return KNeighborsRegressor(n_neighbors=params["n_neighbors"], weights=params["weights"])
     raise ValueError("Unknown regressor")
+
+
+def classify_anomaly(sensor_col, val, prev_val, window_vals, spike_thr, slope_thr):
+    """Rule-based explanation for a flagged anomaly point (generalised from TP2 logic)."""
+    delta = val - prev_val
+    slope = np.mean(np.diff(window_vals)) if len(window_vals) > 1 else 0
+    consec_neg = sum(1 for d in np.diff(window_vals) if d < -0.1 * spike_thr)
+    consec_pos = sum(1 for d in np.diff(window_vals) if d > 0.1 * spike_thr)
+
+    base = f"Detected by ML model because {sensor_col} behaviour is different from the learned normal pattern"
+
+    if delta >= spike_thr:
+        atype = f"{sensor_col} sudden spike up"
+        reason = f"Abnormal type: {atype}; {base}; {sensor_col} jumped suddenly (change=+{delta:.2f})"
+    elif delta <= -spike_thr:
+        atype = f"{sensor_col} sudden drop"
+        reason = f"Abnormal type: {atype}; {base}; {sensor_col} dropped suddenly (change={delta:.2f})"
+    elif slope < -slope_thr and consec_neg >= 2:
+        atype = f"{sensor_col} gradually decreasing"
+        reason = f"Abnormal type: {atype}; {base}"
+    elif slope > slope_thr and consec_pos >= 2:
+        atype = f"{sensor_col} gradually increasing"
+        reason = f"Abnormal type: {atype}; {base}"
+    elif delta >= spike_thr or slope < -slope_thr:
+        atype = f"{sensor_col} sudden drop, {sensor_col} gradually decreasing"
+        reason = f"Abnormal type: {atype}; {base}; {sensor_col} dropped suddenly (change={delta:.2f})"
+    else:
+        atype = f"{sensor_col} unusual combination of pattern"
+        reason = f"Abnormal type: {atype}; {base}"
+
+    return atype, reason
+
+
+def build_anomaly_table(det_result, sensor_col, window_size=5, spike_thr=2.5, slope_thr=0.3):
+    """Build a human-readable explanation table for every flagged anomaly."""
+    det_result = det_result.copy()
+    anom_df = det_result[det_result["anomaly"] == 1]
+    all_vals = det_result[sensor_col].values
+
+    records = []
+    for ts, row in anom_df.iterrows():
+        pos = det_result.index.get_loc(ts)
+        val = row[sensor_col]
+        prev_val = all_vals[pos - 1] if pos > 0 else val
+        start = max(0, pos - window_size + 1)
+        window = all_vals[start: pos + 1]
+
+        atype, reason = classify_anomaly(sensor_col, val, prev_val, window, spike_thr, slope_thr)
+
+        records.append({
+            "Timestamp": ts.strftime("%Y-%m-%d %H:%M"),
+            sensor_col: round(float(val), 2),
+            "Abnormal Type": atype,
+            "Reason": reason,
+        })
+
+    return pd.DataFrame(records)
+
+
+def infer_step(index: pd.DatetimeIndex) -> pd.Timedelta:
+    diffs = index.to_series().diff().dropna()
+    return diffs.median() if len(diffs) else pd.Timedelta(hours=1)
+
+
+def build_linear_forecast(series: pd.Series, horizon: int, trend_window: int):
+    """Simple linear-trend extrapolation forecast with a 95% confidence band."""
+    tail = series.iloc[-trend_window:]
+    x = np.arange(len(tail))
+    slope, intercept = np.polyfit(x, tail.values, 1)
+
+    step = infer_step(series.index)
+    future_index = pd.date_range(start=series.index[-1] + step, periods=horizon, freq=step)
+
+    future_x = np.arange(len(tail), len(tail) + horizon)
+    forecast_vals = slope * future_x + intercept
+
+    resid_std = tail.std()
+    upper_band = forecast_vals + 1.96 * resid_std
+    lower_band = forecast_vals - 1.96 * resid_std
+
+    return pd.DataFrame(
+        {"forecast": forecast_vals, "upper_ci": upper_band, "lower_ci": lower_band},
+        index=future_index,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -158,7 +327,7 @@ if uploaded_file is not None:
         st.sidebar.error(f"Could not read file: {e}")
 
 st.title("🚆 Railway Critical Component — Anomaly Detection & Failure Prediction")
-st.caption("Isolation Forest / LOF / One-Class SVM for anomaly scoring · Random Forest / XGBoost / SVR for failure (score) prediction · configurable thresholding")
+st.caption("6 anomaly-detection models · 6+ failure-prediction (regression) models · configurable thresholding · forecast & failure-zone chart · anomaly explanation table")
 
 if st.session_state.df_raw is None:
     st.info("👈 Upload an Excel file with sensor readings to get started. A timestamp column and one or more numeric sensor columns are expected.")
@@ -233,16 +402,20 @@ st.caption(f"Train: {train.shape[0]:,} rows  |  Test: {test.shape[0]:,} rows")
 # --------------------------------------------------------------------------
 # TABS
 # --------------------------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["🔎 Anomaly Detection", "📈 Failure Prediction (Regression)", "⬇️ Export Results"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🔎 Anomaly Detection",
+    "📈 Failure Prediction (Regression)",
+    "🔮 Forecast & Failure Zone",
+    "📋 Anomaly Explanation",
+    "⬇️ Export Results",
+])
 
 # ==========================================================================
 # TAB 1 — ANOMALY DETECTION
 # ==========================================================================
 with tab1:
     st.subheader("Model & Hyperparameters")
-    model_name = st.selectbox(
-        "Anomaly detection model", ["Isolation Forest", "Local Outlier Factor", "One-Class SVM"]
-    )
+    model_name = st.selectbox("Anomaly detection model", ANOMALY_MODELS)
 
     params = {}
     p1, p2, p3 = st.columns(3)
@@ -258,9 +431,24 @@ with tab1:
             params["n_neighbors"] = st.slider("n_neighbors", 5, 50, 20, 1)
         with p2:
             params["contamination"] = st.slider("contamination", 0.01, 0.20, 0.04, 0.01)
-    else:  # One-Class SVM
+    elif model_name == "One-Class SVM":
         with p1:
             params["nu"] = st.slider("nu (expected anomaly fraction)", 0.01, 0.20, 0.04, 0.01)
+    elif model_name == "Elliptic Envelope (Robust Covariance)":
+        with p1:
+            params["contamination"] = st.slider("contamination", 0.01, 0.20, 0.04, 0.01, key="ee_c")
+        with p2:
+            params["support_fraction"] = st.slider("support_fraction", 0.5, 1.0, 0.8, 0.05, key="ee_sf")
+    elif model_name == "Gaussian Mixture Model":
+        with p1:
+            params["n_components"] = st.slider("n_components (normal-behaviour clusters)", 1, 10, 3, 1, key="gmm_k")
+        with p2:
+            params["contamination"] = st.slider("contamination", 0.01, 0.20, 0.04, 0.01, key="gmm_c")
+    else:  # PCA Reconstruction Error
+        with p1:
+            params["n_components"] = st.slider("n_components (retained variance dims)", 1, max(2, len(feature_columns) - 1), min(3, max(1, len(feature_columns) - 1)), 1, key="pca_k")
+        with p2:
+            params["contamination"] = st.slider("contamination", 0.01, 0.20, 0.04, 0.01, key="pca_c")
 
     run_detect = st.button("🚀 Fit anomaly detection model", type="primary")
 
@@ -337,10 +525,7 @@ with tab2:
         st.info("Run **Anomaly Detection** first (Tab 1) — its anomaly score is used as the regression target for failure prediction.")
     else:
         st.subheader("Model & Hyperparameters")
-        reg_options = ["Random Forest", "Support Vector Regression"]
-        if XGB_AVAILABLE:
-            reg_options.insert(1, "XGBoost")
-        reg_name = st.selectbox("Failure prediction (regression) model", reg_options)
+        reg_name = st.selectbox("Failure prediction (regression) model", REGRESSION_MODELS)
 
         rparams = {}
         r1, r2, r3 = st.columns(3)
@@ -350,6 +535,12 @@ with tab2:
             with r2:
                 depth = st.slider("max_depth (0 = None)", 0, 50, 20, key="rf_d")
                 rparams["max_depth"] = None if depth == 0 else depth
+        elif reg_name == "Extra Trees":
+            with r1:
+                rparams["n_estimators"] = st.slider("n_estimators", 50, 600, 200, 50, key="et_n")
+            with r2:
+                depth = st.slider("max_depth (0 = None)", 0, 50, 20, key="et_d")
+                rparams["max_depth"] = None if depth == 0 else depth
         elif reg_name == "XGBoost":
             with r1:
                 rparams["n_estimators"] = st.slider("n_estimators", 50, 600, 200, 50, key="xgb_n")
@@ -357,11 +548,26 @@ with tab2:
                 rparams["max_depth"] = st.slider("max_depth", 2, 15, 6, key="xgb_d")
             with r3:
                 rparams["learning_rate"] = st.slider("learning_rate", 0.01, 0.5, 0.1, 0.01, key="xgb_lr")
-        else:
+        elif reg_name == "Gradient Boosting":
+            with r1:
+                rparams["n_estimators"] = st.slider("n_estimators", 50, 600, 200, 50, key="gb_n")
+            with r2:
+                rparams["max_depth"] = st.slider("max_depth", 2, 15, 3, key="gb_d")
+            with r3:
+                rparams["learning_rate"] = st.slider("learning_rate", 0.01, 0.5, 0.1, 0.01, key="gb_lr")
+        elif reg_name == "Support Vector Regression":
             with r1:
                 rparams["C"] = st.slider("C", 0.1, 10.0, 2.0, 0.1, key="svr_c")
             with r2:
                 rparams["epsilon"] = st.slider("epsilon", 0.001, 0.5, 0.01, 0.001, key="svr_eps")
+        elif reg_name == "Ridge Regression":
+            with r1:
+                rparams["alpha"] = st.slider("alpha (regularisation strength)", 0.01, 10.0, 1.0, 0.01, key="ridge_a")
+        else:  # K-Nearest Neighbors
+            with r1:
+                rparams["n_neighbors"] = st.slider("n_neighbors", 2, 50, 10, 1, key="knn_n")
+            with r2:
+                rparams["weights"] = st.selectbox("weights", ["uniform", "distance"], key="knn_w")
 
         run_pred = st.button("🚀 Train failure prediction model", type="primary")
 
@@ -433,9 +639,140 @@ with tab2:
                     st.dataframe(pred_df[pred_df["predicted_failure"] == 1].sort_values("predicted_score").head(200), use_container_width=True)
 
 # ==========================================================================
-# TAB 3 — EXPORT
+# TAB 3 — FORECAST & FAILURE ZONE (TP2-style chart, generalised to any sensor)
 # ==========================================================================
 with tab3:
+    if st.session_state.det_result is None or "anomaly" not in st.session_state.det_result.columns:
+        st.info("Run **Anomaly Detection** first (Tab 1) so historical anomalies and thresholds are available.")
+    else:
+        det = st.session_state.det_result
+
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            sensor_default = "TP2" if "TP2" in feature_columns else feature_columns[0]
+            sensor_col = st.selectbox("Sensor to plot", feature_columns, index=feature_columns.index(sensor_default))
+        with fc2:
+            horizon = st.slider("Forecast horizon (steps ahead)", 5, 500, 168)
+        with fc3:
+            trend_window = st.slider("Trend window (points used to fit the trend)", 10, 500, 100)
+
+        run_forecast = st.button("🚀 Generate forecast & failure zone chart", type="primary")
+
+        if run_forecast:
+            normal_vals = det[det["anomaly"] == 0][sensor_col]
+            upper_threshold = normal_vals.max()
+            lower_threshold = normal_vals.min()
+
+            df_forecast = build_linear_forecast(det[sensor_col], horizon, trend_window)
+            df_forecast["anomaly"] = (
+                (df_forecast["forecast"] > upper_threshold) | (df_forecast["forecast"] < lower_threshold)
+            ).astype(int)
+
+            st.session_state["forecast_df"] = df_forecast
+            st.session_state["forecast_sensor"] = sensor_col
+            st.session_state["forecast_thresholds"] = (upper_threshold, lower_threshold)
+
+        if st.session_state.get("forecast_df") is not None and st.session_state.get("forecast_sensor") == sensor_col:
+            df_forecast = st.session_state["forecast_df"]
+            upper_threshold, lower_threshold = st.session_state["forecast_thresholds"]
+
+            train_idx = st.session_state.train.index
+            test_idx = st.session_state.test.index
+            train_sensor = det.loc[det.index.intersection(train_idx)]
+            test_sensor = det.loc[det.index.intersection(test_idx)]
+            hist_anom = det[det["anomaly"] == 1]
+            forecast_anom = df_forecast[df_forecast["anomaly"] == 1]
+            train_end = train_idx[-1]
+            last_ts = det.index[-1]
+
+            fig, ax = plt.subplots(figsize=(16, 7))
+
+            ax.plot(train_sensor.index, train_sensor[sensor_col], color="steelblue", linewidth=1, label="Training Data")
+            ax.plot(test_sensor.index, test_sensor[sensor_col], color="green", linewidth=1.5, label="Testing Data")
+            ax.scatter(hist_anom.index, hist_anom[sensor_col], color="red", s=35, zorder=6, label="Historical Anomaly")
+
+            ax.plot(df_forecast.index, df_forecast["forecast"], color="orange", linewidth=2.5, linestyle="--", label="Forecast")
+            ax.fill_between(df_forecast.index, df_forecast["lower_ci"], df_forecast["upper_ci"], color="orange", alpha=0.20, label="95% Confidence Interval")
+
+            if len(forecast_anom):
+                ax.scatter(forecast_anom.index, forecast_anom["forecast"], color="darkred", marker="D", s=90, zorder=8, label="Forecast Anomaly")
+                ax.scatter(forecast_anom.index, forecast_anom["forecast"], s=400, facecolors="none", edgecolors="red", linewidths=2, zorder=9, label="Failure")
+                first_failure = forecast_anom.iloc[0]
+                ax.annotate(
+                    "Failure",
+                    xy=(first_failure.name, first_failure["forecast"]),
+                    xytext=(30, 30),
+                    textcoords="offset points",
+                    fontsize=13,
+                    fontweight="bold",
+                    color="red",
+                    arrowprops=dict(arrowstyle="->", color="red", lw=2),
+                )
+
+            ax.axhline(upper_threshold, color="crimson", linestyle="--", linewidth=2, label=f"Upper Threshold ({upper_threshold:.2f})")
+            ax.axhline(lower_threshold, color="darkgreen", linestyle="--", linewidth=2, label=f"Lower Threshold ({lower_threshold:.2f})")
+
+            ymin, ymax = ax.get_ylim()
+            ax.axhspan(upper_threshold, ymax, color="red", alpha=0.08)
+            ax.axhspan(ymin, lower_threshold, color="red", alpha=0.08)
+
+            ax.axvline(train_end, color="purple", linestyle=":", linewidth=2, label="Train/Test Split")
+            ax.axvline(last_ts, color="black", linestyle=":", linewidth=2, label="Forecast Start")
+
+            ax.set_title(f"{sensor_col} Sensor Value — Training, Testing and Forecast with Failure Prediction", fontsize=16, fontweight="bold", pad=15)
+            ax.set_xlabel("Time", fontsize=12, fontweight="bold")
+            ax.set_ylabel(f"{sensor_col} Sensor Value", fontsize=12, fontweight="bold")
+            ax.grid(alpha=0.3)
+            ax.legend(loc="upper left", fontsize=9, ncol=2, frameon=True, edgecolor="black")
+            fig.tight_layout()
+
+            st.pyplot(fig)
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Upper threshold", f"{upper_threshold:.3f}")
+            m2.metric("Lower threshold", f"{lower_threshold:.3f}")
+            m3.metric("Forecast points flagged as failure", int(df_forecast["anomaly"].sum()))
+        else:
+            st.info("Set the parameters and click **Generate forecast & failure zone chart**.")
+
+# ==========================================================================
+# TAB 4 — ANOMALY EXPLANATION TABLE
+# ==========================================================================
+with tab4:
+    if st.session_state.det_result is None or "anomaly" not in st.session_state.det_result.columns:
+        st.info("Run **Anomaly Detection** first (Tab 1) to generate the explanation table.")
+    else:
+        det = st.session_state.det_result
+
+        ec1, ec2, ec3, ec4 = st.columns(4)
+        with ec1:
+            exp_sensor = st.selectbox("Sensor column", feature_columns, key="exp_sensor")
+        with ec2:
+            exp_window = st.slider("Window size", 2, 20, 5, key="exp_window")
+        with ec3:
+            default_spike = float(round(det[exp_sensor].std() * 1.5, 2)) or 2.5
+            exp_spike = st.number_input("Spike threshold (Δ)", value=default_spike, step=0.1, key="exp_spike")
+        with ec4:
+            default_slope = float(round(det[exp_sensor].std() * 0.3, 2)) or 0.3
+            exp_slope = st.number_input("Slope threshold", value=default_slope, step=0.05, key="exp_slope")
+
+        anomaly_table = build_anomaly_table(det, exp_sensor, exp_window, exp_spike, exp_slope)
+
+        st.metric("Anomalies explained", len(anomaly_table))
+        st.dataframe(anomaly_table, use_container_width=True, height=500)
+
+        if len(anomaly_table):
+            st.download_button(
+                "⬇️ Download explanation table (CSV)",
+                data=anomaly_table.to_csv(index=False).encode("utf-8"),
+                file_name=f"{exp_sensor}_anomaly_explanations.csv",
+                mime="text/csv",
+            )
+
+# ==========================================================================
+# TAB 5 — EXPORT
+# ==========================================================================
+with tab5:
     st.subheader("Download combined results")
     if st.session_state.det_result is None:
         st.info("Run anomaly detection (and optionally failure prediction) first.")
