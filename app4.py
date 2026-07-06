@@ -120,7 +120,7 @@ for key in ["df_raw", "df", "feature_columns", "train", "test", "scaler",
             "det_result", "det_threshold", "det_model_name",
             "pred_result", "native_threshold", "y_scaler",
             "forecast_df", "forecast_sensor_name", "forecast_thresholds",
-            "anomaly_comparison"]:
+            "anomaly_comparison", "prediction_comparison"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -191,7 +191,6 @@ def compute_asoi_detailed(scores, percentile=5):
 
     raw_gap = mu_norm - mu_anom
 
-    # ASOI formula
     denominator = std_norm + std_anom
     if denominator == 0:
         asoi = 0.0
@@ -607,7 +606,6 @@ with col2:
                 try:
                     _, train_s, test_s, _ = fit_anomaly_model(m, train[feature_columns], test[feature_columns])
                     all_scores = np.concatenate([train_s, test_s])
-                    # Compute ASOI using the new formula
                     asoi_val, raw_gap, mu_norm, mu_anom, std_norm, std_anom = compute_asoi_detailed(all_scores, percentile=5)
                     asoi_dict[m] = asoi_val
                     detail_dict[m] = {
@@ -642,7 +640,6 @@ with col2:
             st.session_state.det_result = result
             st.session_state.det_model_name = best_model
             st.session_state.native_threshold = native_thr
-            # Store comparison table
             st.session_state.anomaly_comparison = pd.DataFrame(detail_dict).T.sort_values('ASOI', ascending=False)
             st.sidebar.success(f"✅ Best: {best_model} (ASOI = {valid_asoi[best_model]:.4f})")
 
@@ -650,7 +647,7 @@ with col2:
 # --------------------------------------------------------------------------
 # MAIN PAGE — MODEL PERFORMANCE COMPARISON TABLE (ASOI)
 # --------------------------------------------------------------------------
-st.subheader("📊 Model Performance Comparison (ASOI)")
+st.subheader("📊 Anomaly Detection Model Performance (ASOI)")
 if st.session_state.get("anomaly_comparison") is not None:
     with st.expander("Show/hide comparison table", expanded=True):
         st.dataframe(
@@ -664,7 +661,7 @@ if st.session_state.get("anomaly_comparison") is not None:
         - **Raw Gap** – simple difference between means (μ_normal - μ_anomaly).
         """)
 else:
-    st.info("👈 Click **'Auto Find Best'** in the sidebar to run all models and see the ASOI comparison table.")
+    st.info("👈 Click **'Auto Find Best'** in the sidebar to run all anomaly models and see the ASOI comparison table.")
 
 
 # --------------------------------------------------------------------------
@@ -720,7 +717,7 @@ else:
     st.sidebar.info("Fit an anomaly model first.")
 
 # --------------------------------------------------------------------------
-# SIDEBAR — FAILURE PREDICTION CONTROLS
+# SIDEBAR — FAILURE PREDICTION CONTROLS (updated: MAE/RMSE selection)
 # --------------------------------------------------------------------------
 st.sidebar.header("📈 Failure Prediction")
 if st.session_state.det_result is not None and "anomaly" in st.session_state.det_result.columns:
@@ -736,6 +733,15 @@ if st.session_state.det_result is not None and "anomaly" in st.session_state.det
                     y_test = det.loc[test.index, "anomaly_score"]
                     _, pred_train, pred_test = fit_regression_model(reg_model, train[feature_columns], y_train,
                                                                      test[feature_columns], y_test)
+                    # Compute metrics
+                    valid_mask = ~np.isnan(pred_test)
+                    if np.sum(valid_mask) > 0:
+                        mae = mean_absolute_error(y_test[valid_mask], pred_test[valid_mask])
+                        rmse = np.sqrt(mean_squared_error(y_test[valid_mask], pred_test[valid_mask]))
+                        r2 = r2_score(y_test[valid_mask], pred_test[valid_mask])
+                    else:
+                        mae, rmse, r2 = np.nan, np.nan, np.nan
+                    # Store result
                     y_true_all = pd.concat([y_train, y_test])
                     y_pred_all = np.concatenate([pred_train, pred_test])
                     pred_df = pd.DataFrame({
@@ -745,12 +751,8 @@ if st.session_state.det_result is not None and "anomaly" in st.session_state.det
                     }, index=y_true_all.index).sort_index()
                     st.session_state.pred_result = pred_df
                     st.session_state["reg_model_name"] = reg_model
-                    valid_mask = ~np.isnan(y_pred_all)
-                    mae = mean_absolute_error(y_true_all[valid_mask], y_pred_all[valid_mask])
-                    rmse = np.sqrt(mean_squared_error(y_true_all[valid_mask], y_pred_all[valid_mask]))
-                    r2 = r2_score(y_true_all[valid_mask], y_pred_all[valid_mask])
                     st.session_state["reg_metrics"] = {"MAE": mae, "RMSE": rmse, "R2": r2}
-                    st.sidebar.success(f"✅ {reg_model} trained.")
+                    st.sidebar.success(f"✅ {reg_model} trained.  RMSE: {rmse:.4f}, MAE: {mae:.4f}, R²: {r2:.4f}")
                 except Exception as e:
                     st.sidebar.error(f"Error: {e}")
     
@@ -760,7 +762,8 @@ if st.session_state.det_result is not None and "anomaly" in st.session_state.det
             y_train = det.loc[train.index, "anomaly_score"]
             y_test = det.loc[test.index, "anomaly_score"]
             best_reg = None
-            best_r2 = -np.inf
+            best_rmse = np.inf
+            pred_metrics = {}
             with st.spinner("Running prediction models..."):
                 for m in REGRESSION_MODELS:
                     try:
@@ -768,36 +771,61 @@ if st.session_state.det_result is not None and "anomaly" in st.session_state.det
                                                                          test[feature_columns], y_test)
                         valid = ~np.isnan(pred_test)
                         if np.sum(valid) > 0:
+                            mae = mean_absolute_error(y_test[valid], pred_test[valid])
+                            rmse = np.sqrt(mean_squared_error(y_test[valid], pred_test[valid]))
                             r2 = r2_score(y_test[valid], pred_test[valid])
                         else:
-                            r2 = -np.inf
-                        if r2 > best_r2:
-                            best_r2 = r2
+                            mae, rmse, r2 = np.nan, np.nan, np.nan
+                        pred_metrics[m] = {'MAE': mae, 'RMSE': rmse, 'R2': r2}
+                        if rmse < best_rmse:
+                            best_rmse = rmse
                             best_reg = m
                             best_pred_train = pred_train
                             best_pred_test = pred_test
                     except Exception as e:
-                        pass
-                if best_reg is not None:
-                    y_true_all = pd.concat([y_train, y_test])
-                    y_pred_all = np.concatenate([best_pred_train, best_pred_test])
-                    pred_df = pd.DataFrame({
-                        "actual_score": y_true_all,
-                        "predicted_score": y_pred_all,
-                        "split": ["train"] * len(y_train) + ["test"] * len(y_test),
-                    }, index=y_true_all.index).sort_index()
-                    st.session_state.pred_result = pred_df
-                    st.session_state["reg_model_name"] = best_reg
-                    valid_mask = ~np.isnan(y_pred_all)
-                    mae = mean_absolute_error(y_true_all[valid_mask], y_pred_all[valid_mask])
-                    rmse = np.sqrt(mean_squared_error(y_true_all[valid_mask], y_pred_all[valid_mask]))
-                    r2 = r2_score(y_true_all[valid_mask], y_pred_all[valid_mask])
-                    st.session_state["reg_metrics"] = {"MAE": mae, "RMSE": rmse, "R2": r2}
-                    st.sidebar.success(f"✅ Best: {best_reg}")
-                else:
-                    st.sidebar.error("All models failed.")
+                        pred_metrics[m] = {'MAE': np.nan, 'RMSE': np.nan, 'R2': np.nan}
+                        continue
+            if best_reg is not None:
+                # Store results for best model
+                y_true_all = pd.concat([y_train, y_test])
+                y_pred_all = np.concatenate([best_pred_train, best_pred_test])
+                pred_df = pd.DataFrame({
+                    "actual_score": y_true_all,
+                    "predicted_score": y_pred_all,
+                    "split": ["train"] * len(y_train) + ["test"] * len(y_test),
+                }, index=y_true_all.index).sort_index()
+                st.session_state.pred_result = pred_df
+                st.session_state["reg_model_name"] = best_reg
+                st.session_state["reg_metrics"] = pred_metrics[best_reg]
+                # Store comparison table
+                comp_df = pd.DataFrame(pred_metrics).T.sort_values('RMSE', ascending=True)
+                st.session_state.prediction_comparison = comp_df
+                st.sidebar.success(f"✅ Best: {best_reg} (RMSE = {best_rmse:.4f})")
+            else:
+                st.sidebar.error("All models failed.")
 else:
     st.sidebar.info("Run anomaly detection first.")
+
+
+# --------------------------------------------------------------------------
+# MAIN PAGE — PREDICTION MODEL PERFORMANCE TABLE (MAE / RMSE)
+# --------------------------------------------------------------------------
+st.subheader("📊 Prediction Model Performance (MAE / RMSE)")
+if st.session_state.get("prediction_comparison") is not None:
+    with st.expander("Show/hide comparison table", expanded=True):
+        # Style the table: highlight the best RMSE (lowest) with green
+        st.dataframe(
+            st.session_state.prediction_comparison.style.background_gradient(subset=['RMSE'], cmap='RdYlGn_r'),
+            use_container_width=True
+        )
+        st.caption("""
+        - **MAE** – Mean Absolute Error (lower is better).
+        - **RMSE** – Root Mean Squared Error (lower is better) – used to select the best model.
+        - **R²** – Coefficient of determination (higher is better, but not used for selection).
+        """)
+else:
+    st.info("👈 Click **'Find Best Prediction'** in the sidebar to run all prediction models and see the performance comparison.")
+
 
 # --------------------------------------------------------------------------
 # SIDEBAR — EXPORT
