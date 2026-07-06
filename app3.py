@@ -872,15 +872,7 @@ if st.session_state.det_result is not None and "anomaly" in st.session_state.det
 else:
     st.info("Run anomaly detection and apply a threshold first.")
 
-# Optional: show data preview and correlation in expanders at the bottom
-with st.expander("📊 Data Preview & Correlations (optional)"):
-    st.dataframe(df_raw.head(20), use_container_width=True)
-    fig = px.line(numeric_df, x=numeric_df.index, y=feature_columns, title="Sensor Trends Over Time")
-    st.plotly_chart(fig, use_container_width=True)
-    if len(feature_columns) > 1:
-        corr = numeric_df.corr()
-        fig2 = px.imshow(corr, text_auto=".2f", color_continuous_scale="RdBu_r", title="Correlation Matrix")
-        st.plotly_chart(fig2, use_container_width=True)
+
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Anomaly Detection & Failure Prediction Dashboard · built with Streamlit")
