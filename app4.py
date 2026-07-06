@@ -569,7 +569,7 @@ st.session_state.train, st.session_state.test, st.session_state.scaler = train, 
 st.sidebar.caption(f"Train: {train.shape[0]:,} rows  |  Test: {test.shape[0]:,} rows")
 
 # --------------------------------------------------------------------------
-# SIDEBAR — ANOMALY DETECTION CONTROLS (with ASOI)
+# SIDEBAR — ANOMALY DETECTION CONTROLS
 # --------------------------------------------------------------------------
 st.sidebar.header("🔎 Anomaly Detection")
 
@@ -645,26 +645,6 @@ with col2:
 
 
 # --------------------------------------------------------------------------
-# MAIN PAGE — MODEL PERFORMANCE COMPARISON TABLE (ASOI)
-# --------------------------------------------------------------------------
-st.subheader("📊 Anomaly Detection Model Performance (ASOI)")
-if st.session_state.get("anomaly_comparison") is not None:
-    with st.expander("Show/hide comparison table", expanded=True):
-        st.dataframe(
-            st.session_state.anomaly_comparison.style.background_gradient(subset=['ASOI'], cmap='RdYlGn'),
-            use_container_width=True
-        )
-        st.caption("""
-        - **ASOI** – higher is better. Formula: |μ_normal - μ_anomaly| / (σ_normal + σ_anomaly).
-        - **Mu Normal / Mu Anomaly** – mean scores of normal and anomaly groups.
-        - **Std Normal / Std Anomaly** – standard deviations of each group.
-        - **Raw Gap** – simple difference between means (μ_normal - μ_anomaly).
-        """)
-else:
-    st.info("👈 Click **'Auto Find Best'** in the sidebar to run all anomaly models and see the ASOI comparison table.")
-
-
-# --------------------------------------------------------------------------
 # SIDEBAR — THRESHOLD METHOD
 # --------------------------------------------------------------------------
 if st.session_state.det_result is not None:
@@ -717,7 +697,7 @@ else:
     st.sidebar.info("Fit an anomaly model first.")
 
 # --------------------------------------------------------------------------
-# SIDEBAR — FAILURE PREDICTION CONTROLS (updated: MAE/RMSE selection)
+# SIDEBAR — FAILURE PREDICTION CONTROLS
 # --------------------------------------------------------------------------
 st.sidebar.header("📈 Failure Prediction")
 if st.session_state.det_result is not None and "anomaly" in st.session_state.det_result.columns:
@@ -797,34 +777,12 @@ if st.session_state.det_result is not None and "anomaly" in st.session_state.det
                 st.session_state.pred_result = pred_df
                 st.session_state["reg_model_name"] = best_reg
                 st.session_state["reg_metrics"] = pred_metrics[best_reg]
-                # Store comparison table
-                comp_df = pd.DataFrame(pred_metrics).T.sort_values('RMSE', ascending=True)
-                st.session_state.prediction_comparison = comp_df
+                st.session_state.prediction_comparison = pd.DataFrame(pred_metrics).T.sort_values('RMSE', ascending=True)
                 st.sidebar.success(f"✅ Best: {best_reg} (RMSE = {best_rmse:.4f})")
             else:
                 st.sidebar.error("All models failed.")
 else:
     st.sidebar.info("Run anomaly detection first.")
-
-
-# --------------------------------------------------------------------------
-# MAIN PAGE — PREDICTION MODEL PERFORMANCE TABLE (MAE / RMSE)
-# --------------------------------------------------------------------------
-st.subheader("📊 Prediction Model Performance (MAE / RMSE)")
-if st.session_state.get("prediction_comparison") is not None:
-    with st.expander("Show/hide comparison table", expanded=True):
-        # Style the table: highlight the best RMSE (lowest) with green
-        st.dataframe(
-            st.session_state.prediction_comparison.style.background_gradient(subset=['RMSE'], cmap='RdYlGn_r'),
-            use_container_width=True
-        )
-        st.caption("""
-        - **MAE** – Mean Absolute Error (lower is better).
-        - **RMSE** – Root Mean Squared Error (lower is better) – used to select the best model.
-        - **R²** – Coefficient of determination (higher is better, but not used for selection).
-        """)
-else:
-    st.info("👈 Click **'Find Best Prediction'** in the sidebar to run all prediction models and see the performance comparison.")
 
 
 # --------------------------------------------------------------------------
@@ -851,7 +809,7 @@ if st.session_state.det_result is not None:
     )
 
 # --------------------------------------------------------------------------
-# MAIN PAGE — FORECAST CHART (metric cards removed)
+# MAIN PAGE — FORECAST CHART
 # --------------------------------------------------------------------------
 st.header("🔮 Forecast & Failure Zone")
 if st.session_state.det_result is None or "anomaly" not in st.session_state.det_result.columns:
@@ -927,7 +885,7 @@ else:
         st.info("Set parameters and click **Generate Forecast**.")
 
 # --------------------------------------------------------------------------
-# MAIN PAGE — ANOMALY EXPLANATION TABLE (only sensor selection)
+# MAIN PAGE — ANOMALY EXPLANATION TABLE
 # --------------------------------------------------------------------------
 st.header("📋 Anomaly Explanation")
 
