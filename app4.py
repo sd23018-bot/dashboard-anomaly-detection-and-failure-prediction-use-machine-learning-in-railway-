@@ -30,7 +30,6 @@ from sklearn.mixture import GaussianMixture
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from scipy.stats import norm
 
 try:
     import xgboost as xgb
@@ -169,64 +168,37 @@ def apply_threshold(scores: pd.Series, method: str, native_thr: float = None, **
 
 def compute_asoi_detailed(scores, percentile=5):
     """
-    Compute ASOI and return all components for verification.
-    Returns: (asoi, cohen_d, overlap, raw_gap)
+    Compute ASOI based on the formula:
+    ASOI = |mu_normal - mu_anomaly| / (std_normal + std_anomaly)
+    Returns: (asoi, raw_gap, mu_norm, mu_anom, std_norm, std_anom)
     """
     scores = np.asarray(scores).flatten()
     if len(scores) < 10:
-        return 0.0, 0.0, 1.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
+    # Split into anomaly and normal groups (lowest percentile% = anomalies)
     threshold = np.percentile(scores, percentile)
     anom_scores = scores[scores <= threshold]
     norm_scores = scores[scores > threshold]
 
     if len(anom_scores) < 2 or len(norm_scores) < 2:
-        return 0.0, 0.0, 1.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
-    mu_a, sigma_a = np.mean(anom_scores), np.std(anom_scores, ddof=1)
-    mu_n, sigma_n = np.mean(norm_scores), np.std(norm_scores, ddof=1)
+    mu_norm = np.mean(norm_scores)
+    mu_anom = np.mean(anom_scores)
+    std_norm = np.std(norm_scores, ddof=1) if len(norm_scores) > 1 else 0
+    std_anom = np.std(anom_scores, ddof=1) if len(anom_scores) > 1 else 0
 
-    raw_gap = mu_n - mu_a
+    raw_gap = mu_norm - mu_anom
 
-    if sigma_a == 0 and sigma_n == 0:
-        return 0.0, 0.0, 1.0, raw_gap
-
-    pooled_std = np.sqrt((sigma_a**2 + sigma_n**2) / 2)
-    if pooled_std == 0:
-        d = 0.0
+    # ASOI formula
+    denominator = std_norm + std_anom
+    if denominator == 0:
+        asoi = 0.0
     else:
-        d = (mu_n - mu_a) / pooled_std
+        asoi = abs(mu_norm - mu_anom) / denominator
 
-    if mu_a > mu_n:
-        mu_a, mu_n = mu_n, mu_a
-        sigma_a, sigma_n = sigma_n, sigma_a
-
-    a = 1/sigma_a**2 - 1/sigma_n**2
-    b = -2*mu_a/sigma_a**2 + 2*mu_n/sigma_n**2
-    c = (mu_a**2)/sigma_a**2 - (mu_n**2)/sigma_n**2 + 2*np.log(sigma_n/sigma_a)
-
-    if abs(a) < 1e-10:
-        x0 = (mu_a + mu_n) / 2
-    else:
-        disc = b**2 - 4*a*c
-        if disc < 0:
-            disc = 0
-        sqrt_disc = np.sqrt(disc)
-        x1 = (-b + sqrt_disc) / (2*a)
-        x2 = (-b - sqrt_disc) / (2*a)
-        if mu_a <= x1 <= mu_n:
-            x0 = x1
-        elif mu_a <= x2 <= mu_n:
-            x0 = x2
-        else:
-            mid = (mu_a + mu_n) / 2
-            x0 = x1 if abs(x1 - mid) < abs(x2 - mid) else x2
-
-    ovl = norm.cdf((x0 - mu_a) / sigma_a) + (1 - norm.cdf((x0 - mu_n) / sigma_n))
-    ovl = min(max(ovl, 0.0), 1.0)
-
-    asoi = (1 - np.exp(-d)) * (1 - ovl)
-    return asoi, d, ovl, raw_gap
+    return asoi, raw_gap, mu_norm, mu_anom, std_norm, std_anom
 
 
 def fit_anomaly_model(model_name, X_train, X_test):
@@ -635,17 +607,20 @@ with col2:
                 try:
                     _, train_s, test_s, _ = fit_anomaly_model(m, train[feature_columns], test[feature_columns])
                     all_scores = np.concatenate([train_s, test_s])
-                    asoi_val, d_val, ovl_val, raw_gap = compute_asoi_detailed(all_scores, percentile=5)
+                    # Compute ASOI using the new formula
+                    asoi_val, raw_gap, mu_norm, mu_anom, std_norm, std_anom = compute_asoi_detailed(all_scores, percentile=5)
                     asoi_dict[m] = asoi_val
                     detail_dict[m] = {
                         'ASOI': asoi_val,
-                        "Cohen's d": d_val,
-                        'Overlap (OVL)': ovl_val,
-                        'Raw Gap': raw_gap
+                        'Raw Gap': raw_gap,
+                        'Mu Normal': mu_norm,
+                        'Mu Anomaly': mu_anom,
+                        'Std Normal': std_norm,
+                        'Std Anomaly': std_anom
                     }
                 except Exception as e:
                     asoi_dict[m] = -np.inf
-                    detail_dict[m] = {'ASOI': -np.inf, "Cohen's d": -np.inf, 'Overlap (OVL)': -np.inf, 'Raw Gap': -np.inf}
+                    detail_dict[m] = {'ASOI': -np.inf, 'Raw Gap': -np.inf, 'Mu Normal': -np.inf, 'Mu Anomaly': -np.inf, 'Std Normal': -np.inf, 'Std Anomaly': -np.inf}
                     st.sidebar.warning(f"⚠️ {m} failed: {e}")
 
         valid_asoi = {k: v for k, v in asoi_dict.items() if v != -np.inf}
@@ -675,18 +650,18 @@ with col2:
 # --------------------------------------------------------------------------
 # MAIN PAGE — MODEL PERFORMANCE COMPARISON TABLE (ASOI)
 # --------------------------------------------------------------------------
+st.subheader("📊 Model Performance Comparison (ASOI)")
 if st.session_state.get("anomaly_comparison") is not None:
-    st.subheader("📊 Model Performance Comparison (ASOI)")
     with st.expander("Show/hide comparison table", expanded=True):
         st.dataframe(
             st.session_state.anomaly_comparison.style.background_gradient(subset=['ASOI'], cmap='RdYlGn'),
             use_container_width=True
         )
         st.caption("""
-        - **ASOI** (0–1, higher = better) – overall quality score.
-        - **Cohen's d** – effect size; larger means better separation between anomaly and normal scores.
-        - **Overlap (OVL)** – fraction of overlap between the two distributions (lower = better).
-        - **Raw Gap** – mean difference between normal and anomaly scores (just for reference).
+        - **ASOI** – higher is better. Formula: |μ_normal - μ_anomaly| / (σ_normal + σ_anomaly).
+        - **Mu Normal / Mu Anomaly** – mean scores of normal and anomaly groups.
+        - **Std Normal / Std Anomaly** – standard deviations of each group.
+        - **Raw Gap** – simple difference between means (μ_normal - μ_anomaly).
         """)
 else:
     st.info("👈 Click **'Auto Find Best'** in the sidebar to run all models and see the ASOI comparison table.")
@@ -920,7 +895,6 @@ else:
         fig.tight_layout()
         st.pyplot(fig)
 
-        # Metric cards removed
     else:
         st.info("Set parameters and click **Generate Forecast**.")
 
