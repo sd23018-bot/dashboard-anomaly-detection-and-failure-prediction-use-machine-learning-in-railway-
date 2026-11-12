@@ -463,20 +463,31 @@ def build_anomaly_table(det_result, sensor_col, window_size=5, spike_thr=2.5, sl
     return pd.DataFrame(records)
 
 
-def infer_step(index: pd.DatetimeIndex) -> pd.Timedelta:
-    diffs = index.to_series().diff().dropna()
-    return diffs.median() if len(diffs) else pd.Timedelta(hours=1)
+def build_linear_forecast(series: pd.Series, horizon_seconds: int, trend_window_seconds: int):
+    series = pd.to_numeric(series, errors="coerce").dropna().sort_index()
+    series = series.groupby(level=0).mean()
+    if len(series) < 2:
+        raise ValueError("At least two valid timestamped sensor readings are required.")
 
+    last = series.index[-1]
+    step = series.index.to_series().diff().dt.total_seconds().median()
+    if not np.isfinite(step) or step <= 0:
+        step = 1.0
 
-def build_linear_forecast(series: pd.Series, horizon: int, trend_window: int):
-    tail = series.iloc[-trend_window:]
-    x = np.arange(len(tail))
-    slope, intercept = np.polyfit(x, tail.values, 1)
-    step = infer_step(series.index)
-    future_index = pd.date_range(start=series.index[-1] + step, periods=horizon, freq=step)
-    future_x = np.arange(len(tail), len(tail) + horizon)
-    forecast_vals = slope * future_x + intercept
-    resid_std = tail.std()
+    tail = series.loc[series.index >= last - pd.Timedelta(seconds=trend_window_seconds)]
+    if len(tail) < 2:
+        tail = series.iloc[-2:]
+
+    elapsed_seconds = (tail.index - last).total_seconds().to_numpy()
+    values = tail.to_numpy(dtype=float)
+    slope, intercept = np.polyfit(elapsed_seconds, values, 1)
+    residuals = values - (slope * elapsed_seconds + intercept)
+    resid_std = float(np.std(residuals, ddof=2)) if len(values) > 2 else 0.0
+
+    forecast_count = max(1, int(round(horizon_seconds / step)))
+    future_seconds = np.arange(1, forecast_count + 1) * step
+    future_index = last + pd.to_timedelta(future_seconds, unit="s")
+    forecast_vals = slope * future_seconds + intercept
     upper_band = forecast_vals + 1.96 * resid_std
     lower_band = forecast_vals - 1.96 * resid_std
     return pd.DataFrame(
@@ -849,19 +860,23 @@ with dashboard_tab:
             sensor_default = "TP2" if "TP2" in feature_columns else feature_columns[0]
             sensor_col = st.selectbox("Sensor for forecast", feature_columns, index=feature_columns.index(sensor_default), key="forecast_sensor")
         with col2:
-            horizon = st.slider("Forecast horizon (steps ahead)", 5, 500, 168, key="forecast_horizon")
+            horizon = st.slider("Forecast horizon (seconds)", 5, 500, 168, key="forecast_horizon")
+        st.caption("Forecast points follow the median sampling interval of your sensor data.")
 
         if st.button("🚀 Generate Forecast"):
             normal_vals = det[det["anomaly"] == 0][sensor_col]
             upper_threshold = normal_vals.max()
             lower_threshold = normal_vals.min()
-            df_forecast = build_linear_forecast(det[sensor_col], horizon, 100)
-            df_forecast["anomaly"] = (
-                (df_forecast["forecast"] > upper_threshold) | (df_forecast["forecast"] < lower_threshold)
-            ).astype(int)
-            st.session_state["forecast_df"] = df_forecast
-            st.session_state["forecast_sensor_name"] = sensor_col
-            st.session_state["forecast_thresholds"] = (upper_threshold, lower_threshold)
+            try:
+                df_forecast = build_linear_forecast(det[sensor_col], horizon, 100)
+                df_forecast["anomaly"] = (
+                    (df_forecast["forecast"] > upper_threshold) | (df_forecast["forecast"] < lower_threshold)
+                ).astype(int)
+                st.session_state["forecast_df"] = df_forecast
+                st.session_state["forecast_sensor_name"] = sensor_col
+                st.session_state["forecast_thresholds"] = (upper_threshold, lower_threshold)
+            except ValueError as e:
+                st.error(f"Could not generate forecast: {e}")
 
         if (st.session_state.get("forecast_df") is not None and 
             st.session_state.get("forecast_sensor_name") == sensor_col and
